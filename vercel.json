@@ -1,4 +1,7 @@
 {
   "regions": ["iad1"],
-  "framework": "vite"
+  "framework": "vite",
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
 }

@@ -59,7 +59,19 @@ function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+// Lazy initialization for Gemini AI
+let aiInstance: GoogleGenAI | null = null;
+const getAI = () => {
+  if (!aiInstance) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      console.warn('GEMINI_API_KEY is missing. AI features will be disabled.');
+      return null;
+    }
+    aiInstance = new GoogleGenAI({ apiKey });
+  }
+  return aiInstance;
+};
 
 const INITIAL_TRANSACTIONS: Transaction[] = [
   { id: '1', title: 'Gaji Bulanan', amount: 15000000, type: 'income', category: 'Salary', date: '2026-03-25', time: '09:00', classification: 'personal' },
@@ -737,6 +749,9 @@ export default function App() {
     }
 
     const timer = setTimeout(async () => {
+      const ai = getAI();
+      if (!ai) return;
+      
       setIsSuggesting(true);
       try {
         const response = await ai.models.generateContent({
@@ -776,6 +791,12 @@ export default function App() {
 
   const handleScanReceipt = async (base64Image: string) => {
     if (!base64Image) return;
+    const ai = getAI();
+    if (!ai) {
+      alert('Fitur AI Scan tidak tersedia karena API Key belum dikonfigurasi.');
+      return;
+    }
+
     setIsScanning(true);
     try {
       const response = await ai.models.generateContent({
