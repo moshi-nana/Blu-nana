@@ -54,6 +54,7 @@ import { twMerge } from 'tailwind-merge';
 import { Transaction } from './types';
 import { GoogleGenAI, Type } from "@google/genai";
 import Papa from 'papaparse';
+import * as XLSX from 'xlsx';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -446,7 +447,7 @@ export default function App() {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const handleExport = () => {
+  const handleExportCSV = () => {
     const mappedTransactions = transactions.map(t => ({
       'Tanggal': t.date,
       'Waktu': t.time,
@@ -470,24 +471,64 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
+  const handleExportExcel = () => {
+    const mappedTransactions = transactions.map(t => ({
+      'Tanggal': t.date,
+      'Waktu': t.time,
+      'Judul Transaksi': t.title,
+      'Jumlah': t.amount,
+      'Tipe': t.type === 'income' ? 'Pemasukan' : 'Pengeluaran',
+      'Kategori': t.category,
+      'Klasifikasi': t.classification === 'business' ? 'Bisnis' : 'Pribadi'
+    }));
+
+    const worksheet = XLSX.utils.json_to_sheet(mappedTransactions);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Transaksi");
+    
+    // Generate buffer
+    const excelBuffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' });
+    const blob = new Blob([excelBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `riwayat_transaksi_${format(new Date(), 'yyyy-MM-dd')}.xlsx`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
   const handleUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
 
+    const isExcel = file.name.toLowerCase().endsWith('.xlsx') || file.name.toLowerCase().endsWith('.xls');
     const reader = new FileReader();
+
     reader.onload = (e) => {
       try {
-        const content = e.target?.result as string;
-        const parsed = Papa.parse(content, { 
-          header: true, 
-          skipEmptyLines: true,
-          transformHeader: (h) => h.trim()
-        });
-        
-        const importedData = parsed.data;
+        const data = e.target?.result;
+        let importedData: any[] = [];
+
+        if (isExcel) {
+          const workbook = XLSX.read(data, { type: 'array' });
+          const firstSheetName = workbook.SheetNames[0];
+          const worksheet = workbook.Sheets[firstSheetName];
+          importedData = XLSX.utils.sheet_to_json(worksheet);
+        } else {
+          // Assume CSV
+          const content = typeof data === 'string' ? data : new TextDecoder().decode(data as ArrayBuffer);
+          const parsed = Papa.parse(content, { 
+            header: true, 
+            skipEmptyLines: true,
+            transformHeader: (h) => h.trim()
+          });
+          importedData = parsed.data;
+        }
         
         if (!Array.isArray(importedData) || importedData.length === 0) {
-          setImportStatus({ message: 'File CSV kosong atau tidak valid.', type: 'error' });
+          setImportStatus({ message: 'File kosong atau tidak valid.', type: 'error' });
           return;
         }
 
@@ -563,14 +604,19 @@ export default function App() {
             performImport();
           }
         } else {
-          setImportStatus({ message: 'Tidak ada data transaksi yang valid ditemukan dalam file CSV ini.', type: 'error' });
+          setImportStatus({ message: 'Tidak ada data transaksi yang valid ditemukan dalam file ini.', type: 'error' });
         }
       } catch (err) {
-        setImportStatus({ message: 'Gagal membaca file CSV. Pastikan formatnya benar.', type: 'error' });
+        setImportStatus({ message: 'Gagal membaca file. Pastikan formatnya benar.', type: 'error' });
       }
       if (event.target) event.target.value = '';
     };
-    reader.readAsText(file);
+
+    if (isExcel) {
+      reader.readAsArrayBuffer(file);
+    } else {
+      reader.readAsText(file);
+    }
   };
 
   const filteredTransactions = useMemo(() => {
@@ -1053,21 +1099,31 @@ export default function App() {
                   type="file" 
                   ref={fileInputRef} 
                   onChange={handleUpload} 
-                  accept=".csv" 
+                  accept=".csv,.xlsx,.xls" 
                   className="hidden" 
                 />
-                <button 
-                  onClick={handleExport}
-                  className="p-2 bg-white rounded-xl shadow-sm text-gray-500 hover:text-blu-primary transition-colors flex items-center gap-1"
-                  title="Export CSV"
-                >
-                  <span className="text-xs font-bold">CSV</span>
-                  <Download size={18} />
-                </button>
+                <div className="flex bg-white rounded-xl shadow-sm overflow-hidden">
+                  <button 
+                    onClick={handleExportCSV}
+                    className="p-2 text-gray-500 hover:text-blu-primary hover:bg-gray-50 transition-colors border-r border-gray-100 flex items-center gap-1"
+                    title="Export CSV"
+                  >
+                    <span className="text-[10px] font-bold">CSV</span>
+                    <Download size={14} />
+                  </button>
+                  <button 
+                    onClick={handleExportExcel}
+                    className="p-2 text-gray-500 hover:text-blu-primary hover:bg-gray-50 transition-colors flex items-center gap-1"
+                    title="Export Excel"
+                  >
+                    <span className="text-[10px] font-bold">XLSX</span>
+                    <Download size={14} />
+                  </button>
+                </div>
                 <button 
                   onClick={() => fileInputRef.current?.click()}
                   className="p-2 bg-white rounded-xl shadow-sm text-gray-500 hover:text-blu-primary transition-colors"
-                  title="Import CSV"
+                  title="Import Spreadsheet"
                 >
                   <Upload size={18} />
                 </button>
