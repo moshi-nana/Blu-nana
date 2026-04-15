@@ -1,0 +1,7 @@
+{
+  "name": "bluTracker",
+  "description": "A monthly financial tracking application inspired by blu by BCA, featuring balance overview, transaction history, and AI-powered receipt scanning.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
