@@ -56,6 +56,7 @@ import { GoogleGenAI, Type } from "@google/genai";
 import Papa from 'papaparse';
 import * as XLSX from 'xlsx';
 
+import { SpeedInsights } from '@vercel/speed-insights/react';
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
@@ -2412,6 +2413,7 @@ function ScannerModal({ onClose, onScan, isScanning }: { onClose: () => void, on
           100% { top: 0%; }
         }
       `}</style>
+      <SpeedInsights />
     </div>
   );
 }
