@@ -51,7 +51,7 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
-import { Transaction } from './types';
+import { Transaction, TransactionType, DebtType } from './types';
 import { GoogleGenAI, Type } from "@google/genai";
 import Papa from 'papaparse';
 import * as XLSX from 'xlsx';
@@ -87,6 +87,7 @@ interface TransactionItemProps {
   transaction: Transaction;
   onDelete: () => void;
   onEdit: () => void;
+  onToggleSettled: () => void;
   formatCurrency: (amount: number) => string;
   isRevealed: boolean;
   onReveal: (isRevealed: boolean) => void;
@@ -96,13 +97,15 @@ const TransactionItem = React.memo<TransactionItemProps>(({
   transaction: t, 
   onDelete, 
   onEdit,
+  onToggleSettled,
   formatCurrency,
   isRevealed,
   onReveal
 }) => {
   const handleDragEnd = (_: any, info: any) => {
     // Threshold for revealing
-    if (info.offset.x < -80) {
+    const threshold = t.isDebt ? -240 : -160;
+    if (info.offset.x < threshold / 2) {
       onReveal(true);
     } else if (info.offset.x > 40) {
       onReveal(false);
@@ -111,11 +114,33 @@ const TransactionItem = React.memo<TransactionItemProps>(({
     }
   };
 
+  const getDebtLabel = () => {
+    if (t.debtType === 'borrow') return 'Piutang (Pinjam)';
+    if (t.debtType === 'lend') return 'Utang (Meminjami)';
+    return 'Hutang';
+  };
+
   return (
     <div className="relative mb-3 rounded-2xl overflow-hidden isolate shadow-sm border border-gray-100">
       {/* Background Layer - Actions */}
       <div className="absolute inset-[5px] bg-gray-100 flex justify-end items-center rounded-[11px] overflow-hidden">
         <div className="flex h-full">
+          {t.isDebt && (
+            <div 
+              className={cn(
+                "w-[80px] h-full flex flex-col items-center justify-center transition-colors cursor-pointer",
+                t.isSettled ? "bg-orange-500 text-white" : "bg-green-600 text-white"
+              )}
+              onClick={(e) => {
+                e.stopPropagation();
+                onToggleSettled();
+                onReveal(false);
+              }}
+            >
+              <RotateCcw size={18} />
+              <span className="text-[8px] font-bold uppercase mt-1">{t.isSettled ? 'Belum' : 'Lunas'}</span>
+            </div>
+          )}
           <div 
             className="w-[80px] h-full flex flex-col items-center justify-center bg-blu-primary text-white active:bg-blu-dark transition-colors cursor-pointer"
             onClick={(e) => {
@@ -144,15 +169,13 @@ const TransactionItem = React.memo<TransactionItemProps>(({
       {/* Foreground Content */}
       <motion.div 
         drag="x"
-        dragConstraints={{ left: -160, right: 0 }}
+        dragConstraints={{ left: t.isDebt ? -240 : -160, right: 0 }}
         dragElastic={0.15}
         whileTap={{ cursor: 'grabbing' }}
         dragTransition={{ bounceStiffness: 500, bounceDamping: 35 }}
-        animate={{ x: isRevealed ? -160 : 0 }}
+        animate={{ x: isRevealed ? (t.isDebt ? -240 : -160) : 0 }}
         transition={{ type: "spring", stiffness: 400, damping: 40, mass: 0.6 }}
         onDragStart={() => {
-          // Close other items immediately when starting to drag a new one
-          // but don't reveal this one yet to avoid jitter
           if (!isRevealed) {
             onReveal(false);
           }
@@ -163,19 +186,35 @@ const TransactionItem = React.memo<TransactionItemProps>(({
         }}
         className={cn(
           "p-4 flex items-center justify-between bg-white relative z-10 cursor-grab active:cursor-grabbing",
-          isRevealed ? "shadow-inner" : ""
+          isRevealed ? "shadow-inner" : "",
+          t.isSettled && "opacity-60"
         )}
       >
         <div className="flex items-center gap-4">
           <div className={cn(
             "w-10 h-10 rounded-xl flex items-center justify-center",
-            t.type === 'income' ? "bg-green-100 text-green-600" : "bg-red-100 text-red-600"
+            t.type === 'income' ? "bg-green-100 text-green-600" : 
+            t.type === 'expense' ? "bg-red-100 text-red-600" :
+            "bg-orange-100 text-orange-600"
           )}>
-            {t.type === 'income' ? <ArrowDownLeft size={20} /> : <ArrowUpRight size={20} />}
+            {t.type === 'income' ? <ArrowDownLeft size={20} /> : 
+             t.type === 'expense' ? <ArrowUpRight size={20} /> :
+             <CreditCard size={20} />}
           </div>
           <div>
             <div className="flex items-center gap-2">
-              <p className="font-semibold text-sm text-gray-800">{t.title}</p>
+              <p className={cn(
+                "font-semibold text-sm text-gray-800",
+                t.isSettled && "line-through"
+              )}>{t.title}</p>
+              {t.type === 'debt' && (
+                <span className={cn(
+                  "text-[8px] px-1.5 py-0.5 rounded-full font-bold uppercase tracking-tighter",
+                  t.isSettled ? "bg-gray-200 text-gray-500" : "bg-orange-100 text-orange-600"
+                )}>
+                  {t.isSettled ? 'Lunas' : getDebtLabel()}
+                </span>
+              )}
               <span className={cn(
                 "text-[9px] px-1.5 py-0.5 rounded-full font-bold uppercase tracking-tighter",
                 t.classification === 'business' ? "bg-blue-100 text-blue-600" : "bg-purple-100 text-purple-600"
@@ -189,9 +228,12 @@ const TransactionItem = React.memo<TransactionItemProps>(({
         <div className="flex items-center gap-3">
           <p className={cn(
             "font-bold text-sm",
-            t.type === 'income' ? "text-green-600" : "text-red-600"
+            t.isSettled ? "text-gray-400" : 
+            t.type === 'income' ? "text-green-600" : 
+            t.type === 'expense' ? "text-red-600" :
+            "text-orange-600"
           )}>
-            {t.type === 'income' ? '+' : '-'}{formatCurrency(t.amount)}
+            {t.isSettled ? '' : (t.type === 'income' ? '+' : t.type === 'expense' ? '-' : '')}{formatCurrency(t.amount)}
           </p>
         </div>
       </motion.div>
@@ -200,6 +242,19 @@ const TransactionItem = React.memo<TransactionItemProps>(({
 });
 
 export default function App() {
+  // Register Service Worker for PWA
+  useEffect(() => {
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js').then(registration => {
+          console.log('SW registered: ', registration);
+        }).catch(registrationError => {
+          console.log('SW registration failed: ', registrationError);
+        });
+      });
+    }
+  }, []);
+
   const [transactions, setTransactions] = useState<Transaction[]>(() => {
     const saved = localStorage.getItem('blu_transactions');
     if (saved) {
@@ -218,7 +273,7 @@ export default function App() {
     localStorage.setItem('blu_transactions', JSON.stringify(transactions));
   }, [transactions]);
 
-  const [activeTab, setActiveTab] = useState<'home' | 'history'>('home');
+  const [activeTab, setActiveTab] = useState<'home' | 'history' | 'debt'>('home');
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isScannerOpen, setIsScannerOpen] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
@@ -235,10 +290,13 @@ export default function App() {
   // Form State
   const [newTitle, setNewTitle] = useState('');
   const [newAmount, setNewAmount] = useState('');
+  const [newDate, setNewDate] = useState('');
   const [newTime, setNewTime] = useState('');
-  const [newType, setNewType] = useState<'income' | 'expense'>('expense');
+  const [newType, setNewType] = useState<TransactionType>('expense');
   const [newCategory, setNewCategory] = useState('General');
   const [newClassification, setNewClassification] = useState<'personal' | 'business'>('personal');
+  const [newDebtType, setNewDebtType] = useState<DebtType>('borrow');
+  const [newIsSettled, setNewIsSettled] = useState(false);
 
   // Filter & Sort State
   const [sortBy, setSortBy] = useState<'date' | 'amount' | 'category'>('date');
@@ -263,6 +321,8 @@ export default function App() {
       window.history.replaceState({}, document.title, window.location.pathname);
     }
   }, []);
+
+  const [historySubTab, setHistorySubTab] = useState<'all' | 'debt'>('all');
 
   // Local Keyword Rules for Instant Categorization
   const LOCAL_RULES: Record<string, { category: string, classification: 'personal' | 'business' }> = {
@@ -332,7 +392,24 @@ export default function App() {
   }, [transactions]);
 
   const totalBalance = useMemo(() => {
-    return transactions.reduce((acc, t) => t.type === 'income' ? acc + t.amount : acc - t.amount, 0);
+    return transactions.reduce((acc, t) => {
+      if (t.type === 'income') return acc + t.amount;
+      if (t.type === 'expense') return acc - t.amount;
+      if (t.type === 'debt') {
+        if (t.isSettled) return acc; // Settled debts don't affect current balance in this simple model (assuming payment was a separate transaction or just cleared)
+        // Actually, if I borrow and it's NOT settled, I have the cash.
+        // If it IS settled, I paid it back, so the cash is gone.
+        return t.debtType === 'borrow' ? acc + t.amount : acc - t.amount;
+      }
+      return acc;
+    }, 0);
+  }, [transactions]);
+
+  const debtStats = useMemo(() => {
+    const activeDebts = transactions.filter(t => t.type === 'debt' && !t.isSettled);
+    const borrow = activeDebts.filter(t => t.debtType === 'borrow').reduce((acc, t) => acc + t.amount, 0);
+    const lend = activeDebts.filter(t => t.debtType === 'lend').reduce((acc, t) => acc + t.amount, 0);
+    return { borrow, lend };
   }, [transactions]);
 
   const monthlyIncome = useMemo(() => 
@@ -622,6 +699,13 @@ export default function App() {
   const filteredTransactions = useMemo(() => {
     let result = [...transactions];
 
+    // Tab filter
+    if (activeTab === 'history') {
+      result = result.filter(t => t.type !== 'debt');
+    } else if (activeTab === 'debt') {
+      result = result.filter(t => t.type === 'debt');
+    }
+
     // Search filter
     if (searchQuery) {
       result = result.filter(t => 
@@ -654,7 +738,7 @@ export default function App() {
     });
 
     return result;
-  }, [transactions, searchQuery, filterCategory, filterClassification, sortBy, sortOrder]);
+  }, [transactions, searchQuery, filterCategory, filterClassification, sortBy, sortOrder, activeTab, historySubTab]);
 
   const filteredMonthlyIncome = useMemo(() => 
     filteredTransactions
@@ -733,8 +817,11 @@ export default function App() {
               amount: parseFloat(rawAmount),
               type: newType,
               category: newCategory,
+              date: newDate || t.date,
               time: finalTime,
               classification: newClassification,
+              debtType: newType === 'debt' ? newDebtType : undefined,
+              isSettled: newType === 'debt' ? newIsSettled : undefined,
             }
           : t
       ));
@@ -746,9 +833,11 @@ export default function App() {
         amount: parseFloat(rawAmount),
         type: newType,
         category: newCategory,
-        date: format(now, 'yyyy-MM-dd'),
+        date: newDate || format(now, 'yyyy-MM-dd'),
         time: finalTime,
         classification: newClassification,
+        debtType: newType === 'debt' ? newDebtType : undefined,
+        isSettled: newType === 'debt' ? false : undefined,
       };
       setTransactions([newTransaction, ...transactions]);
     }
@@ -756,9 +845,17 @@ export default function App() {
     // Reset form
     setNewTitle('');
     setNewAmount('');
+    setNewDate('');
     setNewTime('');
     setEditingTransaction(null);
     setIsModalOpen(false);
+  };
+
+  const handleToggleSettled = (id: string) => {
+    setTransactions(prev => prev.map(t => 
+      t.id === id ? { ...t, isSettled: !t.isSettled } : t
+    ));
+    setRevealedId(null);
   };
 
   const handleEditClick = (t: Transaction) => {
@@ -767,8 +864,11 @@ export default function App() {
     setNewAmount(formatInputNumber(t.amount.toString()));
     setNewType(t.type);
     setNewCategory(t.category);
+    setNewDate(t.date);
     setNewTime(t.time || '');
     setNewClassification(t.classification);
+    setNewDebtType(t.debtType || 'borrow');
+    setNewIsSettled(t.isSettled || false);
     setIsModalOpen(true);
   };
 
@@ -1079,6 +1179,7 @@ export default function App() {
                       transaction={t} 
                       onDelete={() => setTransactionToDelete(t)} 
                       onEdit={() => handleEditClick(t)}
+                      onToggleSettled={() => handleToggleSettled(t.id)}
                       formatCurrency={formatCurrency}
                       isRevealed={revealedId === t.id}
                       onReveal={(isRevealed) => handleReveal(t.id, isRevealed)}
@@ -1093,7 +1194,7 @@ export default function App() {
         {activeTab === 'history' && (
           <section className="space-y-6">
             <div className="flex justify-between items-center">
-              <h2 className="text-2xl font-bold text-gray-800">Riwayat</h2>
+              <h2 className="text-2xl font-bold text-gray-800">Catatan Riwayat</h2>
               <div className="flex items-center gap-2">
                 <input 
                   type="file" 
@@ -1275,6 +1376,7 @@ export default function App() {
                       transaction={t} 
                       onDelete={() => setTransactionToDelete(t)} 
                       onEdit={() => handleEditClick(t)}
+                      onToggleSettled={() => handleToggleSettled(t.id)}
                       formatCurrency={formatCurrency}
                       isRevealed={revealedId === t.id}
                       onReveal={(isRevealed) => handleReveal(t.id, isRevealed)}
@@ -1293,6 +1395,80 @@ export default function App() {
                   </motion.div>
                 )}
               </AnimatePresence>
+            </div>
+          </section>
+        )}
+
+        {activeTab === 'debt' && (
+          <section className="space-y-6">
+            <div className="flex justify-between items-center px-1">
+              <h2 className="text-2xl font-bold text-gray-800">Hutang & Piutang</h2>
+              <div className="flex bg-white rounded-xl shadow-sm overflow-hidden p-1">
+                <button 
+                  onClick={handleExportExcel}
+                  className="p-2 text-gray-500 hover:text-blu-primary transition-colors flex items-center gap-1"
+                  title="Export Excel"
+                >
+                  <Download size={18} />
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div className="bg-orange-50 p-4 rounded-3xl border border-orange-100 shadow-sm relative overflow-hidden">
+                <div className="absolute -right-2 -top-2 opacity-10">
+                  <ArrowDownLeft size={64} className="text-orange-600" />
+                </div>
+                <p className="text-[10px] font-bold text-orange-600 uppercase tracking-tighter mb-1 relative z-10">Piutang (Pinjam)</p>
+                <p className="text-xl font-black text-orange-900 relative z-10">{formatCurrency(debtStats.borrow)}</p>
+                <p className="text-[9px] text-orange-600/60 mt-1">Uang yang kamu pinjam</p>
+              </div>
+              <div className="bg-blue-50 p-4 rounded-3xl border border-blue-100 shadow-sm relative overflow-hidden">
+                <div className="absolute -right-2 -top-2 opacity-10">
+                  <ArrowUpRight size={64} className="text-blue-600" />
+                </div>
+                <p className="text-[10px] font-bold text-blue-600 uppercase tracking-tighter mb-1 relative z-10">Utang (Meminjami)</p>
+                <p className="text-xl font-black text-blue-900 relative z-10">{formatCurrency(debtStats.lend)}</p>
+                <p className="text-[9px] text-blue-600/60 mt-1">Uang yang kamu pinjamkan</p>
+              </div>
+            </div>
+
+            <div className="space-y-4">
+              <div className="flex justify-between items-center px-1">
+                <h3 className="text-sm font-bold text-gray-400 uppercase tracking-widest">Daftar Tagihan</h3>
+                {filteredTransactions.length > 0 && (
+                  <span className="text-[10px] bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full font-bold">
+                    {filteredTransactions.length} Transaksi
+                  </span>
+                )}
+              </div>
+              
+              {filteredTransactions.length === 0 ? (
+                <div className="flex flex-col items-center justify-center py-16 bg-white rounded-3xl border border-dashed border-gray-200">
+                  <div className="w-16 h-16 bg-gray-50 rounded-full flex items-center justify-center mb-4">
+                    <CreditCard size={32} className="text-gray-300" />
+                  </div>
+                  <p className="text-gray-400 font-bold text-sm">Tidak ada hutang aktif</p>
+                  <p className="text-gray-300 text-xs mt-1">Gunakan tombol + untuk menambah</p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <AnimatePresence>
+                    {filteredTransactions.map(t => (
+                      <TransactionItem 
+                        key={t.id} 
+                        transaction={t} 
+                        onDelete={() => setTransactionToDelete(t)} 
+                        onEdit={() => handleEditClick(t)}
+                        onToggleSettled={() => handleToggleSettled(t.id)}
+                        formatCurrency={formatCurrency}
+                        isRevealed={revealedId === t.id}
+                        onReveal={(isRevealed) => handleReveal(t.id, isRevealed)}
+                      />
+                    ))}
+                  </AnimatePresence>
+                </div>
+              )}
             </div>
           </section>
         )}
@@ -1691,6 +1867,7 @@ export default function App() {
                             transaction={t} 
                             onDelete={() => setTransactionToDelete(t)} 
                             onEdit={() => handleEditClick(t)}
+                            onToggleSettled={() => handleToggleSettled(t.id)}
                             formatCurrency={formatCurrency}
                             isRevealed={revealedId === t.id}
                             onReveal={(isRevealed) => handleReveal(t.id, isRevealed)}
@@ -1772,20 +1949,30 @@ export default function App() {
       </div>
 
       {/* Bottom Navigation */}
-      <nav className="fixed bottom-0 left-0 right-0 max-w-md mx-auto bg-white border-t border-gray-100 px-6 py-4 flex justify-around items-center z-50 rounded-t-3xl shadow-[0_-10px_20px_rgba(0,0,0,0.05)]">
+      <nav className="fixed bottom-0 left-0 right-0 max-w-md mx-auto bg-white border-t border-gray-200 px-2 py-3 flex justify-around items-center z-50 rounded-t-[32px] shadow-[0_-10px_30px_rgba(0,0,0,0.08)]">
         {[
-          { id: 'home', icon: <Wallet /> },
-          { id: 'history', icon: <History /> },
+          { id: 'home', icon: <Wallet size={24} />, label: 'Beranda' },
+          { id: 'debt', icon: <CreditCard size={24} />, label: 'Hutang' },
+          { id: 'history', icon: <History size={24} />, label: 'Riwayat' },
         ].map((tab) => (
           <button 
             key={tab.id}
-            onClick={() => setActiveTab(tab.id as any)}
+            onClick={() => {
+              console.log('Switching to tab:', tab.id);
+              setActiveTab(tab.id as any);
+            }}
             className={cn(
-              "p-3 rounded-2xl transition-all",
-              activeTab === tab.id ? "bg-blu-primary/10 text-blu-primary" : "text-gray-400"
+              "flex flex-col items-center gap-1.5 p-2 transition-all flex-1",
+              activeTab === tab.id ? "text-blu-primary" : "text-gray-400"
             )}
           >
-            {tab.icon}
+            <div className={cn(
+              "p-2.5 rounded-2xl transition-all",
+              activeTab === tab.id ? "bg-blu-primary/10" : "hover:bg-gray-50"
+            )}>
+              {tab.icon}
+            </div>
+            <span className="text-[10px] font-black uppercase tracking-widest">{tab.label}</span>
           </button>
         ))}
       </nav>
@@ -1826,7 +2013,7 @@ export default function App() {
                   type="button"
                   onClick={() => setNewType('expense')}
                   className={cn(
-                    "flex-1 py-2 text-sm font-bold rounded-lg transition-all",
+                    "flex-1 py-1.5 text-[10px] font-bold rounded-lg transition-all",
                     newType === 'expense' ? "bg-white text-red-600 shadow-sm" : "text-gray-500"
                   )}
                 >
@@ -1836,13 +2023,48 @@ export default function App() {
                   type="button"
                   onClick={() => setNewType('income')}
                   className={cn(
-                    "flex-1 py-2 text-sm font-bold rounded-lg transition-all",
+                    "flex-1 py-1.5 text-[10px] font-bold rounded-lg transition-all",
                     newType === 'income' ? "bg-white text-green-600 shadow-sm" : "text-gray-500"
                   )}
                 >
                   Pemasukan
                 </button>
+                <button 
+                  type="button"
+                  onClick={() => setNewType('debt')}
+                  className={cn(
+                    "flex-1 py-1.5 text-[10px] font-bold rounded-lg transition-all",
+                    newType === 'debt' ? "bg-white text-orange-600 shadow-sm" : "text-gray-500"
+                  )}
+                >
+                  Hutang
+                </button>
               </div>
+
+              {newType === 'debt' && (
+                <div className="flex p-1 bg-orange-50 rounded-xl">
+                  <button 
+                    type="button"
+                    onClick={() => setNewDebtType('borrow')}
+                    className={cn(
+                      "flex-1 py-1.5 text-[10px] font-bold rounded-lg transition-all",
+                      newDebtType === 'borrow' ? "bg-white text-orange-600 shadow-sm border border-orange-100" : "text-gray-500"
+                    )}
+                  >
+                    Piutang (Pinjam)
+                  </button>
+                  <button 
+                    type="button"
+                    onClick={() => setNewDebtType('lend')}
+                    className={cn(
+                      "flex-1 py-1.5 text-[10px] font-bold rounded-lg transition-all",
+                      newDebtType === 'lend' ? "bg-white text-orange-600 shadow-sm border border-orange-100" : "text-gray-500"
+                    )}
+                  >
+                    Utang (Meminjami)
+                  </button>
+                </div>
+              )}
 
               <div className="space-y-2">
                 <div className="flex justify-between items-center">
@@ -1913,39 +2135,50 @@ export default function App() {
                   </select>
                 </div>
                 <div className="space-y-2">
-                  <label className="text-xs font-bold text-gray-500 uppercase tracking-wider">Waktu</label>
-                  <input 
-                    type="time" 
-                    value={newTime}
-                    onChange={(e) => setNewTime(e.target.value)}
-                    className="blu-input"
-                  />
+                  <label className="text-xs font-bold text-gray-500 uppercase tracking-wider">Klasifikasi</label>
+                  <div className="flex p-1 bg-gray-100 rounded-xl">
+                    <button 
+                      type="button"
+                      onClick={() => setNewClassification('personal')}
+                      className={cn(
+                        "flex-1 py-2 text-[10px] font-bold rounded-lg transition-all",
+                        newClassification === 'personal' ? "bg-white text-purple-600 shadow-sm" : "text-gray-500"
+                      )}
+                    >
+                      Pribadi
+                    </button>
+                    <button 
+                      type="button"
+                      onClick={() => setNewClassification('business')}
+                      className={cn(
+                        "flex-1 py-2 text-[10px] font-bold rounded-lg transition-all",
+                        newClassification === 'business' ? "bg-white text-blue-600 shadow-sm" : "text-gray-500"
+                      )}
+                    >
+                      Bisnis
+                    </button>
+                  </div>
                 </div>
               </div>
 
-              <div className="space-y-2">
-                <label className="text-xs font-bold text-gray-500 uppercase tracking-wider">Klasifikasi</label>
-                <div className="flex p-1 bg-gray-100 rounded-xl">
-                  <button 
-                    type="button"
-                    onClick={() => setNewClassification('personal')}
-                    className={cn(
-                      "flex-1 py-2 text-xs font-bold rounded-lg transition-all",
-                      newClassification === 'personal' ? "bg-white text-purple-600 shadow-sm" : "text-gray-500"
-                    )}
-                  >
-                    Pribadi
-                  </button>
-                  <button 
-                    type="button"
-                    onClick={() => setNewClassification('business')}
-                    className={cn(
-                      "flex-1 py-2 text-xs font-bold rounded-lg transition-all",
-                      newClassification === 'business' ? "bg-white text-blue-600 shadow-sm" : "text-gray-500"
-                    )}
-                  >
-                    Bisnis
-                  </button>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <label className="text-xs font-bold text-gray-500 uppercase tracking-wider">Tanggal</label>
+                  <input 
+                    type="date" 
+                    value={newDate || format(new Date(), 'yyyy-MM-dd')}
+                    onChange={(e) => setNewDate(e.target.value)}
+                    className="blu-input"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-xs font-bold text-gray-500 uppercase tracking-wider">Waktu</label>
+                  <input 
+                    type="time" 
+                    value={newTime || format(new Date(), 'HH:mm')}
+                    onChange={(e) => setNewTime(e.target.value)}
+                    className="blu-input"
+                  />
                 </div>
               </div>
 
