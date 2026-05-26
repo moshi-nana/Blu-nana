@@ -27,9 +27,12 @@ import {
   Play,
   LayoutGrid,
   Download,
-  Upload
+  Upload,
+  Sparkles,
+  Bot
 } from 'lucide-react';
-import { format, parseISO, isSameMonth, startOfMonth, endOfMonth, eachDayOfInterval } from 'date-fns';
+import { format, parseISO, isSameMonth, startOfMonth, endOfMonth, eachDayOfInterval, subMonths, addMonths, isBefore } from 'date-fns';
+import { id } from 'date-fns/locale';
 import { 
   BarChart, 
   Bar, 
@@ -52,27 +55,15 @@ import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { Transaction, TransactionType, DebtType } from './types';
-import { GoogleGenAI, Type } from "@google/genai";
 import Papa from 'papaparse';
 import * as XLSX from 'xlsx';
+import { db, auth, googleProvider, handleFirestoreError, OperationType } from './firebase';
+import { collection, onSnapshot, getDocs, doc, setDoc, deleteDoc, query, where, updateDoc, serverTimestamp, getDoc, writeBatch } from 'firebase/firestore';
+import { signInWithPopup, onAuthStateChanged, User } from 'firebase/auth';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
-
-// Lazy initialization for Gemini AI
-let aiInstance: GoogleGenAI | null = null;
-const getAI = () => {
-  if (!aiInstance) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      console.warn('GEMINI_API_KEY is missing. AI features will be disabled.');
-      return null;
-    }
-    aiInstance = new GoogleGenAI({ apiKey });
-  }
-  return aiInstance;
-};
 
 const INITIAL_TRANSACTIONS: Transaction[] = [
   { id: '1', title: 'Gaji Bulanan', amount: 15000000, type: 'income', category: 'Salary', date: '2026-03-25', time: '09:00', classification: 'personal' },
@@ -255,23 +246,169 @@ export default function App() {
     }
   }, []);
 
+  const [user, setUser] = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(false);
   const [transactions, setTransactions] = useState<Transaction[]>(() => {
-    const saved = localStorage.getItem('blu_transactions');
+    const saved = localStorage.getItem('blutracker_transactions');
     if (saved) {
       try {
         return JSON.parse(saved);
       } catch (e) {
-        console.error("Failed to load transactions:", e);
-        return INITIAL_TRANSACTIONS;
+        return [];
       }
     }
-    return INITIAL_TRANSACTIONS;
+    const hasVisited = localStorage.getItem('blutracker_visited');
+    if (!hasVisited) {
+      localStorage.setItem('blutracker_visited', 'true');
+      return INITIAL_TRANSACTIONS;
+    }
+    return [];
   });
 
-  // Save to localStorage whenever transactions change
   useEffect(() => {
-    localStorage.setItem('blu_transactions', JSON.stringify(transactions));
-  }, [transactions]);
+    if (authReady && !user) {
+      localStorage.setItem('blutracker_transactions', JSON.stringify(transactions));
+    }
+  }, [transactions, user, authReady]);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      setAuthReady(true);
+      
+      // Update User Doc
+      if (currentUser) {
+        const localSaved = localStorage.getItem('blutracker_transactions');
+        if (localSaved) {
+            try {
+                const localTransactions: Transaction[] = JSON.parse(localSaved);
+                const unsynced = localTransactions.filter(t => t.id.length < 10 && !t.id.includes('-'));
+                if (unsynced.length > 0) {
+                   const batch = writeBatch(db);
+                   unsynced.forEach(t => {
+                     const newRef = doc(collection(db, `users/${currentUser.uid}/transactions`));
+                     const { id, ...data } = t;
+                     const dataToSave: any = {
+                        ...data,
+                        ownerId: currentUser.uid,
+                        createdAt: serverTimestamp(),
+                        updatedAt: serverTimestamp(),
+                        isDebt: t.type === 'debt' ? true : false,
+                     };
+                     if (t.type === 'debt') {
+                         dataToSave.isSettled = t.isSettled || false;
+                         dataToSave.debtType = t.debtType || 'borrow';
+                     }
+                     batch.set(newRef, dataToSave);
+                   });
+                   batch.commit().then(() => {
+                        console.log("Local transactions synced to Cloud.");
+                        localStorage.removeItem('blutracker_transactions');
+                   }).catch(e => console.error("Sync error", e));
+                } else {
+                    localStorage.removeItem('blutracker_transactions');
+                }
+            } catch (e) {
+                console.error("Local sync parsing error", e);
+            }
+        }
+
+        const userDocRef = doc(db, 'users', currentUser.uid);
+        getDoc(userDocRef).then((uDoc) => {
+          if (!uDoc.exists()) {
+            setDoc(userDocRef, {
+              email: currentUser.email,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp()
+            }).catch(error => {
+              handleFirestoreError(error, OperationType.WRITE, `users/${currentUser.uid}`);
+            });
+          } else {
+            setDoc(userDocRef, {
+              updatedAt: serverTimestamp()
+            }, { merge: true }).catch(error => {
+              handleFirestoreError(error, OperationType.WRITE, `users/${currentUser.uid}`);
+            });
+          }
+        }).catch(error => {
+          handleFirestoreError(error, OperationType.GET, `users/${currentUser.uid}`);
+        });
+      } else {
+        const saved = localStorage.getItem('blutracker_transactions');
+        if (saved) {
+          try {
+            setTransactions(JSON.parse(saved));
+          } catch (e) {
+            setTransactions([]);
+          }
+        } else {
+          setTransactions([]);
+        }
+      }
+    });
+    return unsubscribe;
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+    
+    // Test connection first
+    getDocs(collection(db, `users/${user.uid}/transactions`)).catch(error => {
+      if(error instanceof Error && error.message.includes('the client is offline')) {
+        console.error("Please check your Firebase configuration.");
+      }
+    });
+
+    const q = collection(db, `users/${user.uid}/transactions`);
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const fbTransactions = snapshot.docs.map(doc => {
+        const data = doc.data();
+        let finalTx: Transaction = {
+          id: doc.id,
+          title: data.title,
+          amount: data.amount,
+          type: data.type,
+          category: data.category,
+          date: data.date,
+          time: data.time,
+          classification: data.classification,
+          ownerId: data.ownerId,
+        };
+        if (data.isDebt !== undefined) finalTx.isDebt = data.isDebt;
+        if (data.debtType !== undefined) finalTx.debtType = data.debtType;
+        if (data.isSettled !== undefined) finalTx.isSettled = data.isSettled;
+        return finalTx;
+      });
+      // Fallback initially if none exists? No, user starts fresh
+      setTransactions(fbTransactions);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.GET, `users/${user.uid}/transactions`);
+    });
+
+    return unsubscribe;
+  }, [user]);
+
+  const loginWithGoogle = async () => {
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (e: any) {
+      if (e.code === 'auth/popup-closed-by-user' || e.code === 'auth/cancelled-popup-request') {
+        // Silently ignore user cancellation
+        return;
+      }
+      console.error("Login gagal:", e);
+      alert("Gagal masuk dengan Google. Silakan coba lagi.");
+    }
+  };
+
+  const logout = async () => {
+    try {
+      await auth.signOut();
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
 
   const [activeTab, setActiveTab] = useState<'home' | 'history' | 'debt'>('home');
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -286,6 +423,11 @@ export default function App() {
   const [statsView, setStatsView] = useState<'weekly' | 'daily'>('weekly');
   const [revealedId, setRevealedId] = useState<string | null>(null);
   const [importStatus, setImportStatus] = useState<{ message: string, type: 'success' | 'error' | 'confirm', onConfirm?: () => void } | null>(null);
+  const [isAiAnalyzing, setIsAiAnalyzing] = useState(false);
+  const [aiAnalysisResult, setAiAnalysisResult] = useState<string | null>(null);
+
+  const [isAiAnalysisModalOpen, setIsAiAnalysisModalOpen] = useState(false);
+  const [isDebtModalOpen, setIsDebtModalOpen] = useState(false);
 
   // Form State
   const [newTitle, setNewTitle] = useState('');
@@ -323,6 +465,14 @@ export default function App() {
   }, []);
 
   const [historySubTab, setHistorySubTab] = useState<'all' | 'debt'>('all');
+  const [selectedMonth, setSelectedMonth] = useState<Date>(new Date());
+
+  const handlePrevMonth = () => {
+    setSelectedMonth(prev => subMonths(prev, 1));
+    setStatsView('weekly');
+  };
+  const handleNextMonth = () => setSelectedMonth(prev => addMonths(prev, 1));
+  const isCurrentMonth = isSameMonth(selectedMonth, new Date());
 
   // Local Keyword Rules for Instant Categorization
   const LOCAL_RULES: Record<string, { category: string, classification: 'personal' | 'business' }> = {
@@ -385,7 +535,7 @@ export default function App() {
     const categories = ['Food', 'Shopping', 'Bensin', 'Perbaikan', 'Entertainment', 'General'];
     return categories.map(cat => {
       const amount = transactions
-        .filter(t => t.type === 'expense' && t.category === cat && isSameMonth(parseISO(t.date), new Date()))
+        .filter(t => t.type === 'expense' && t.category === cat && isSameMonth(parseISO(t.date), selectedMonth))
         .reduce((acc, t) => acc + t.amount, 0);
       return { name: cat, value: amount };
     }).filter(item => item.value > 0);
@@ -414,15 +564,36 @@ export default function App() {
 
   const monthlyIncome = useMemo(() => 
     transactions
-      .filter(t => t.type === 'income' && isSameMonth(parseISO(t.date), new Date()))
+      .filter(t => t.type === 'income' && isSameMonth(parseISO(t.date), selectedMonth))
       .reduce((acc, t) => acc + t.amount, 0)
-  , [transactions]);
+  , [transactions, selectedMonth]);
 
   const monthlyExpense = useMemo(() => 
     transactions
-      .filter(t => t.type === 'expense' && isSameMonth(parseISO(t.date), new Date()))
+      .filter(t => t.type === 'expense' && isSameMonth(parseISO(t.date), selectedMonth))
       .reduce((acc, t) => acc + t.amount, 0)
-  , [transactions]);
+  , [transactions, selectedMonth]);
+
+  const startBalance = useMemo(() => {
+    const start = startOfMonth(selectedMonth);
+    return transactions
+      .filter(t => parseISO(t.date) < start)
+      .reduce((acc, t) => {
+        if (t.type === 'income') return acc + t.amount;
+        if (t.type === 'expense') return acc - t.amount;
+        if (t.type === 'debt') {
+          if (t.isSettled) return acc;
+          return t.debtType === 'borrow' ? acc + t.amount : acc - t.amount;
+        }
+        return acc;
+      }, 0);
+  }, [transactions, selectedMonth]);
+
+  const endBalance = useMemo(() => {
+    return startBalance + transactions.filter(t => t.type === 'income' && isSameMonth(parseISO(t.date), selectedMonth)).reduce((a,b) => a+b.amount, 0) - transactions.filter(t => t.type === 'expense' && isSameMonth(parseISO(t.date), selectedMonth)).reduce((a,b) => a+b.amount, 0) + transactions.filter(t => t.type === 'debt' && isSameMonth(parseISO(t.date), selectedMonth) && !t.isSettled).reduce((acc, t) => t.debtType === 'borrow' ? acc + t.amount : acc - t.amount, 0);
+  }, [startBalance, transactions, selectedMonth]);
+
+  const totalBalanceToDisplay = isCurrentMonth ? totalBalance : endBalance;
 
   const chartData = useMemo(() => {
     const last7Days = Array.from({ length: 7 }, (_, i) => {
@@ -448,8 +619,8 @@ export default function App() {
   }, [transactions]);
 
   const monthlyChartData = useMemo(() => {
-    const start = startOfMonth(new Date());
-    const end = endOfMonth(new Date());
+    const start = startOfMonth(selectedMonth);
+    const end = isCurrentMonth ? new Date() : endOfMonth(selectedMonth);
     const days = eachDayOfInterval({ start, end });
 
     // Calculate balance before this month started
@@ -523,6 +694,57 @@ export default function App() {
   }, [transactions, selectedCategory]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleRemoveDuplicates = async () => {
+    if (!user) return;
+    if (!window.confirm("Apakah Anda yakin ingin menghapus data transaksi yang persis sama (duplikat)? Ini akan memeriksa cloud dan menghapusnya secara permanen.")) return;
+    
+    try {
+      const seen = new Set();
+      const duplicateIds: string[] = [];
+      
+      transactions.forEach(t => {
+        const key = `${t.title}-${t.amount}-${t.date}-${t.time}-${t.type}-${t.category}`;
+        if (seen.has(key)) {
+          duplicateIds.push(t.id);
+        } else {
+          seen.add(key);
+        }
+      });
+
+      if (duplicateIds.length === 0) {
+        alert("Tidak ada data duplikat yang ditemukan.");
+        return;
+      }
+
+      setImportStatus({ message: `Menghapus ${duplicateIds.length} data ganda, mohon tunggu...`, type: 'confirm' });
+
+      const batchArray = [];
+      let currentBatch = writeBatch(db);
+      let opCount = 0;
+
+      for (const id of duplicateIds) {
+        const docRef = doc(db, `users/${user.uid}/transactions`, id);
+        currentBatch.delete(docRef);
+        opCount++;
+        if (opCount === 500) {
+          batchArray.push(currentBatch.commit());
+          currentBatch = writeBatch(db);
+          opCount = 0;
+        }
+      }
+      if (opCount > 0) {
+        batchArray.push(currentBatch.commit());
+      }
+
+      await Promise.all(batchArray);
+      setImportStatus({ message: `Berhasil menghapus ${duplicateIds.length} transaksi ganda dari cloud.`, type: 'success' });
+      setRevealedId(null);
+    } catch (e) {
+      console.error(e);
+      alert("Gagal menghapus data ganda.");
+    }
+  };
 
   const handleExportCSV = () => {
     const mappedTransactions = transactions.map(t => ({
@@ -665,10 +887,39 @@ export default function App() {
         });
 
         if (validTransactions.length > 0) {
-          const performImport = () => {
-            setTransactions(validTransactions);
-            setRevealedId(null);
-            setImportStatus({ message: `Berhasil mengimpor ${validTransactions.length} transaksi.`, type: 'success' });
+          const performImport = async () => {
+            if (!user) {
+                setTransactions(validTransactions);
+                setRevealedId(null);
+                setImportStatus({ message: `Berhasil mengimpor ${validTransactions.length} transaksi di penyimpanan lokal (tidak tersinkronisasi, silakan login).`, type: 'success' });
+                return;
+            }
+            
+            try {
+                const batch = writeBatch(db);
+                validTransactions.forEach(t => {
+                    const newTransactionRef = doc(collection(db, `users/${user.uid}/transactions`));
+                    const { id, ...transactionData } = t;
+                    const dataToSave: any = {
+                        ...transactionData,
+                        ownerId: user.uid,
+                        createdAt: serverTimestamp(),
+                        updatedAt: serverTimestamp(),
+                        isDebt: t.type === 'debt' ? true : false,
+                    };
+                    if (t.type === 'debt') {
+                        dataToSave.isSettled = t.isSettled || false;
+                        dataToSave.debtType = t.debtType || 'borrow';
+                    }
+                    batch.set(newTransactionRef, dataToSave);
+                });
+                await batch.commit();
+                setRevealedId(null);
+                setImportStatus({ message: `Berhasil mengimpor ${validTransactions.length} transaksi ke akun Google Anda.`, type: 'success' });
+            } catch (error) {
+                setImportStatus({ message: 'Gagal mengimpor data ke Cloud.', type: 'error' });
+                handleFirestoreError(error, OperationType.CREATE, `users/${user.uid}/transactions`);
+            }
           };
 
           if (errors.length > 0) {
@@ -698,6 +949,11 @@ export default function App() {
 
   const filteredTransactions = useMemo(() => {
     let result = [...transactions];
+
+    // Month filter for history
+    if (activeTab === 'history') {
+      result = result.filter(t => isSameMonth(parseISO(t.date), selectedMonth));
+    }
 
     // Tab filter
     if (activeTab === 'history') {
@@ -738,19 +994,61 @@ export default function App() {
     });
 
     return result;
-  }, [transactions, searchQuery, filterCategory, filterClassification, sortBy, sortOrder, activeTab, historySubTab]);
+  }, [transactions, searchQuery, filterCategory, filterClassification, sortBy, sortOrder, activeTab, historySubTab, selectedMonth]);
 
   const filteredMonthlyIncome = useMemo(() => 
     filteredTransactions
-      .filter(t => t.type === 'income' && isSameMonth(parseISO(t.date), new Date()))
+      .filter(t => t.type === 'income' && isSameMonth(parseISO(t.date), selectedMonth))
       .reduce((acc, t) => acc + t.amount, 0)
-  , [filteredTransactions]);
+  , [filteredTransactions, selectedMonth]);
 
   const filteredMonthlyExpense = useMemo(() => 
     filteredTransactions
-      .filter(t => t.type === 'expense' && isSameMonth(parseISO(t.date), new Date()))
+      .filter(t => t.type === 'expense' && isSameMonth(parseISO(t.date), selectedMonth))
       .reduce((acc, t) => acc + t.amount, 0)
-  , [filteredTransactions]);
+  , [filteredTransactions, selectedMonth]);
+
+  const analyzeBusinessWithAI = async () => {
+    const businessTransactions = filteredTransactions.filter(
+      t => t.classification === 'business' && isSameMonth(parseISO(t.date), selectedMonth)
+    );
+    if (businessTransactions.length === 0) {
+      alert("Tidak ada transaksi bisnis untuk bulan ini.");
+      return;
+    }
+
+    setIsAiAnalyzing(true);
+    setAiAnalysisResult(null);
+
+    try {
+      const prompt = `Saya memiliki data transaksi bisnis berikut untuk bulan ${format(selectedMonth, 'MMMM yyyy', {locale: id})}:
+${businessTransactions.map(t => `- ${t.date} ${t.time}: ${t.title} (${t.type === 'income' ? 'Pemasukan' : 'Pengeluaran'}) Rp ${t.amount} [Kategori: ${t.category}]`).join('\n')}
+
+Tolong berikan analisis singkat dan saran yang membangun untuk bisnis saya. Fokus pada kesehatan arus kas, kategori pengeluaran terbesar, dan saran untuk bulan berikutnya. Berikan dalam bahasa Indonesia yang ringkas dan profesional, format plain text atau markdown sederhana.`;
+
+      const res = await fetch("/api/gemini", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ contents: prompt })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Gagal menghubungi AI");
+
+      setAiAnalysisResult(data.text);
+      setIsAiAnalysisModalOpen(true);
+    } catch (error: any) {
+      console.error(error);
+      if (error?.message?.toLowerCase().includes('api key')) {
+         setAiAnalysisResult("Fitur AI: Harap pastikan Anda telah memasukkan API Key Gemini yang valid di menu pengaturan.");
+         setIsAiAnalysisModalOpen(true);
+      } else {
+         setAiAnalysisResult("Maaf, terjadi kesalahan saat menganalisis data.");
+         setIsAiAnalysisModalOpen(true);
+      }
+    } finally {
+      setIsAiAnalyzing(false);
+    }
+  };
 
   const formatCurrency = (amount: number) => {
     return new Intl.NumberFormat('id-ID', {
@@ -798,7 +1096,7 @@ export default function App() {
     return new Intl.NumberFormat('id-ID').format(num);
   };
 
-  const handleAddTransaction = (e: React.FormEvent) => {
+  const handleAddTransaction = async (e: React.FormEvent) => {
     e.preventDefault();
     const rawAmount = newAmount.replace(/\D/g, '');
     if (!newTitle || !rawAmount) return;
@@ -807,55 +1105,110 @@ export default function App() {
     const currentTime = format(now, 'HH:mm');
     const finalTime = newTime || currentTime;
 
-    if (editingTransaction) {
-      // Update existing transaction
-      setTransactions(prev => prev.map(t => 
-        t.id === editingTransaction.id 
-          ? {
-              ...t,
-              title: newTitle,
-              amount: parseFloat(rawAmount),
-              type: newType,
-              category: newCategory,
-              date: newDate || t.date,
-              time: finalTime,
-              classification: newClassification,
-              debtType: newType === 'debt' ? newDebtType : undefined,
-              isSettled: newType === 'debt' ? newIsSettled : undefined,
-            }
-          : t
-      ));
-    } else {
-      // Add new transaction
-      const newTransaction: Transaction = {
-        id: Math.random().toString(36).substr(2, 9),
+    if (!user) {
+      let savedTx: Transaction = {
+        id: editingTransaction ? editingTransaction.id : Math.random().toString(36).substring(2, 9),
         title: newTitle,
         amount: parseFloat(rawAmount),
         type: newType,
         category: newCategory,
-        date: newDate || format(now, 'yyyy-MM-dd'),
+        date: newDate || (editingTransaction ? editingTransaction.date : format(now, 'yyyy-MM-dd')),
         time: finalTime,
         classification: newClassification,
-        debtType: newType === 'debt' ? newDebtType : undefined,
-        isSettled: newType === 'debt' ? false : undefined,
+        isDebt: newType === 'debt',
       };
-      setTransactions([newTransaction, ...transactions]);
+      if (newType === 'debt') {
+        savedTx.debtType = newDebtType;
+        savedTx.isSettled = editingTransaction ? (editingTransaction.isSettled || false) : false;
+      }
+
+      if (editingTransaction) {
+        setTransactions(prev => prev.map(t => t.id === editingTransaction.id ? savedTx : t));
+      } else {
+        setTransactions(prev => [...prev, savedTx]);
+      }
+
+      setNewTitle('');
+      setNewAmount('');
+      setNewDate('');
+      setNewTime('');
+      setEditingTransaction(null);
+      setIsModalOpen(false);
+      return;
     }
-    
-    // Reset form
-    setNewTitle('');
-    setNewAmount('');
-    setNewDate('');
-    setNewTime('');
-    setEditingTransaction(null);
-    setIsModalOpen(false);
+
+    try {
+      if (editingTransaction) {
+        const docId = editingTransaction.id.length < 10 && !editingTransaction.id.includes('-') ? Math.random().toString(36).substring(2, 9) : editingTransaction.id;
+        const docRef = doc(db, `users/${user.uid}/transactions`, docId);
+        const updateData: any = {
+          title: newTitle,
+          amount: parseFloat(rawAmount),
+          type: newType,
+          category: newCategory,
+          date: newDate || editingTransaction.date,
+          time: finalTime,
+          classification: newClassification,
+          ownerId: user.uid,
+          updatedAt: serverTimestamp(),
+          isDebt: newType === 'debt' ? true : false,
+        };
+        if (newType === 'debt') {
+          updateData.debtType = newDebtType;
+          updateData.isSettled = newIsSettled;
+        }
+        await setDoc(docRef, updateData, { merge: true });
+      } else {
+        const newTransactionRef = doc(collection(db, `users/${user.uid}/transactions`));
+        const newData: any = {
+          title: newTitle,
+          amount: parseFloat(rawAmount),
+          type: newType,
+          category: newCategory,
+          date: newDate || format(now, 'yyyy-MM-dd'),
+          time: finalTime,
+          classification: newClassification,
+          ownerId: user.uid,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+          isDebt: newType === 'debt' ? true : false,
+        };
+        if (newType === 'debt') {
+          newData.debtType = newDebtType;
+          newData.isSettled = false;
+        }
+        await setDoc(newTransactionRef, newData);
+      }
+      
+      // Reset form
+      setNewTitle('');
+      setNewAmount('');
+      setNewDate('');
+      setNewTime('');
+      setEditingTransaction(null);
+      setIsModalOpen(false);
+    } catch (error) {
+      handleFirestoreError(error, editingTransaction ? OperationType.UPDATE : OperationType.CREATE, `users/${user.uid}/transactions`);
+    }
   };
 
-  const handleToggleSettled = (id: string) => {
-    setTransactions(prev => prev.map(t => 
-      t.id === id ? { ...t, isSettled: !t.isSettled } : t
-    ));
-    setRevealedId(null);
+  const handleToggleSettled = async (t: Transaction) => {
+    if (!user) {
+      setTransactions(prev => prev.map(item => item.id === t.id ? { ...item, isSettled: !item.isSettled } : item));
+      setRevealedId(null);
+      return;
+    }
+    try {
+      const docRef = doc(db, `users/${user.uid}/transactions`, t.id);
+      await setDoc(docRef, {
+        isSettled: !t.isSettled,
+        ownerId: user.uid,
+        updatedAt: serverTimestamp()
+      }, { merge: true });
+      setRevealedId(null);
+    } catch (error) {
+       handleFirestoreError(error, OperationType.UPDATE, `users/${user.uid}/transactions`);
+    }
   };
 
   const handleEditClick = (t: Transaction) => {
@@ -872,10 +1225,20 @@ export default function App() {
     setIsModalOpen(true);
   };
 
-  const handleDeleteTransaction = () => {
+  const handleDeleteTransaction = async () => {
     if (transactionToDelete) {
-      setTransactions(prev => prev.filter(t => t.id !== transactionToDelete.id));
-      setTransactionToDelete(null);
+      if (!user) {
+        setTransactions(prev => prev.filter(t => t.id !== transactionToDelete.id));
+        setTransactionToDelete(null);
+        return;
+      }
+      try {
+        const docRef = doc(db, `users/${user.uid}/transactions`, transactionToDelete.id);
+        await deleteDoc(docRef);
+        setTransactionToDelete(null);
+      } catch (error) {
+        handleFirestoreError(error, OperationType.DELETE, `users/${user.uid}/transactions`);
+      }
     }
   };
 
@@ -895,34 +1258,38 @@ export default function App() {
     }
 
     const timer = setTimeout(async () => {
-      const ai = getAI();
-      if (!ai) return;
-      
       setIsSuggesting(true);
       try {
-        const response = await ai.models.generateContent({
-          model: "gemini-3.1-flash-lite-preview", // Use lite for faster response
-          contents: [
-            {
-              text: `Analyze: "${newTitle}". 
-              Categories: Food, Salary, Entertainment, Shopping, Bensin, Perbaikan, Bonus, General.
-              Classifications: personal, business.
-              Return JSON: {category, classification}`,
-            }
-          ],
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                category: { type: Type.STRING },
-                classification: { type: Type.STRING, enum: ["personal", "business"] },
+        const res = await fetch("/api/gemini", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "gemini-3.5-flash",
+            contents: [
+              {
+                text: `Analyze: "${newTitle}". 
+                Categories: Food, Salary, Entertainment, Shopping, Bensin, Perbaikan, Bonus, General.
+                Classifications: personal, business.
+                Return JSON: {category, classification}`,
+              }
+            ],
+            config: {
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: "OBJECT",
+                properties: {
+                  category: { type: "STRING" },
+                  classification: { type: "STRING", enum: ["personal", "business"] },
+                },
+                required: ["category", "classification"],
               },
-              required: ["category", "classification"],
-            },
-          },
+            }
+          })
         });
-        const result = JSON.parse(response.text || '{}');
+        
+        if (!res.ok) return;
+        const data = await res.json();
+        const result = JSON.parse(data.text || '{}');
         if (result.category) setNewCategory(result.category);
         if (result.classification) setNewClassification(result.classification);
       } catch (error) {
@@ -937,44 +1304,46 @@ export default function App() {
 
   const handleScanReceipt = async (base64Image: string) => {
     if (!base64Image) return;
-    const ai = getAI();
-    if (!ai) {
-      alert('Fitur AI Scan tidak tersedia karena API Key belum dikonfigurasi.');
-      return;
-    }
 
     setIsScanning(true);
     try {
-      const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: [
-          {
-            inlineData: {
-              mimeType: "image/jpeg",
-              data: base64Image.includes(',') ? base64Image.split(',')[1] : base64Image,
+      const res = await fetch("/api/gemini", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "gemini-3.5-flash",
+          contents: [
+            {
+              inlineData: {
+                mimeType: "image/jpeg",
+                data: base64Image.includes(',') ? base64Image.split(',')[1] : base64Image,
+              },
             },
-          },
-          {
-            text: "Extract transaction details from this receipt. Return JSON with fields: title, amount (number), type (income or expense), category (Food, Salary, Entertainment, Shopping, Bensin, Perbaikan, Bonus, General), and classification (personal or business).",
-          },
-        ],
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              title: { type: Type.STRING },
-              amount: { type: Type.NUMBER },
-              type: { type: Type.STRING, enum: ["income", "expense"] },
-              category: { type: Type.STRING },
-              classification: { type: Type.STRING, enum: ["personal", "business"] },
+            {
+              text: "Extract transaction details from this receipt. Return JSON with fields: title, amount (number), type (income or expense), category (Food, Salary, Entertainment, Shopping, Bensin, Perbaikan, Bonus, General), and classification (personal or business).",
             },
-            required: ["title", "amount", "type", "category", "classification"],
-          },
-        },
+          ],
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: "OBJECT",
+              properties: {
+                title: { type: "STRING" },
+                amount: { type: "NUMBER" },
+                type: { type: "STRING", enum: ["income", "expense"] },
+                category: { type: "STRING" },
+                classification: { type: "STRING", enum: ["personal", "business"] },
+              },
+              required: ["title", "amount", "type", "category", "classification"],
+            },
+          }
+        })
       });
+      
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Gagal AI Scan");
 
-      const extracted = JSON.parse(response.text || '{}');
+      const extracted = JSON.parse(data.text || '{}');
       setNewTitle(extracted.title || '');
       setNewAmount(formatInputNumber(extracted.amount?.toString() || ''));
       setNewType(extracted.type || 'expense');
@@ -983,9 +1352,13 @@ export default function App() {
       setNewTime(format(new Date(), 'HH:mm'));
       setIsScannerOpen(false);
       setIsModalOpen(true);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Scanning failed:", error);
-      alert("Gagal memindai struk. Pastikan struk terlihat jelas dan lurus.");
+      if (error?.message?.toLowerCase().includes('api key')) {
+         alert("Fitur AI: Harap pastikan Anda telah memasukkan API Key Gemini yang valid di menu pengaturan.");
+      } else {
+         alert("Gagal memindai struk. Pastikan struk terlihat jelas dan lurus.");
+      }
     } finally {
       setIsScanning(false);
     }
@@ -1046,20 +1419,40 @@ export default function App() {
         <header className="bg-blu-primary text-white p-6 rounded-b-[32px] shadow-lg">
           <div className="flex justify-between items-center mb-8">
             <div className="flex items-center gap-2">
-              <div className="w-10 h-10 bg-white rounded-xl flex items-center justify-center overflow-hidden shadow-sm">
-                <img 
-                  src="https://lh3.googleusercontent.com/d/1NlDy8y5U5b-pGukQn83wiBaNpYbl66ao" 
-                  alt="Logo" 
-                  className="w-full h-full object-contain p-1"
-                  referrerPolicy="no-referrer"
-                />
+              <div className="w-10 h-10 bg-white rounded-xl flex items-center justify-center overflow-hidden shadow-sm uppercase font-bold text-blu-primary text-xl relative">
+                {user?.photoURL ? (
+                  <img 
+                    src={user.photoURL} 
+                    alt="Logo" 
+                    className="w-full h-full object-cover"
+                    referrerPolicy="no-referrer"
+                  />
+                ) : (
+                  <span>{user?.displayName ? user.displayName.charAt(0) : 'U'}</span>
+                )}
+                {!user && (
+                    <div className="absolute inset-0 bg-black/10 flex items-center justify-center">
+                        <ArrowUpRight size={16} />
+                    </div>
+                )}
               </div>
-              <div>
-                <p className="text-xs opacity-80">Selamat Pagi,</p>
-                <p className="font-semibold">Faruzan Scara</p>
+              <div 
+                className={cn("cursor-pointer", !user && "hover:opacity-80 transition-opacity")}
+                onClick={!user ? loginWithGoogle : undefined}
+              >
+                <p className="text-xs opacity-80">{user ? 'Selamat Pagi,' : 'Belum Masuk'}</p>
+                <p className="font-semibold">{user ? (user.displayName || user.email) : 'Klik untuk Login'}</p>
               </div>
             </div>
             <div className="flex items-center gap-3 flex-1 justify-end">
+              {user && (
+                <button 
+                  onClick={logout}
+                  className="text-white/80 hover:text-white transition-colors text-xs"
+                >
+                  Logout
+                </button>
+              )}
               <AnimatePresence>
                 {isSearchOpen && (
                   <motion.div 
@@ -1089,24 +1482,52 @@ export default function App() {
                 )}
               </AnimatePresence>
               {!isSearchOpen && (
-                <button 
-                  onClick={() => setIsSearchOpen(true)}
-                  className="p-2 bg-white/20 rounded-full hover:bg-white/30 transition-colors"
-                >
-                  <Search size={20} />
-                </button>
+                <div className="flex items-center gap-2">
+                  <button 
+                    onClick={() => setIsDebtModalOpen(true)}
+                    className="p-2 bg-white/20 rounded-full hover:bg-white/30 transition-colors flex items-center justify-center text-white"
+                    title="Hutang & Piutang"
+                  >
+                    <CreditCard size={20} />
+                  </button>
+                  <button 
+                    onClick={() => setIsSearchOpen(true)}
+                    className="p-2 bg-white/20 rounded-full hover:bg-white/30 transition-colors flex items-center justify-center text-white"
+                  >
+                    <Search size={20} />
+                  </button>
+                </div>
               )}
             </div>
           </div>
 
-          <div className="space-y-1">
-            <p className="text-sm opacity-80">Total Saldo Kamu</p>
+          <div className="space-y-1 mb-6">
+            <p className="text-sm opacity-80">{isCurrentMonth ? 'Total Saldo Kamu' : 'Saldo Akhir Bulan'}</p>
             <h2 className="text-3xl font-bold tracking-tight">
-              {formatCurrency(totalBalance)}
+              {formatCurrency(totalBalanceToDisplay)}
             </h2>
+            {!isCurrentMonth && (
+              <p className="text-xs opacity-70 font-medium">Saldo Awal: {formatCurrency(startBalance)}</p>
+            )}
           </div>
 
-          <div className="grid grid-cols-2 gap-4 mt-8">
+          <div className="flex items-center justify-between mb-6 bg-white/5 rounded-full px-3 py-1 text-xs max-w-[220px] mx-auto border border-white/5">
+            <button onClick={handlePrevMonth} className="p-0.5 hover:bg-white/10 rounded-full transition-colors text-white/80 hover:text-white">
+              <ArrowDownLeft size={14} className="rotate-45" />
+            </button>
+            <div className="font-semibold tracking-wider text-[11px] text-white/90">
+              {format(selectedMonth, 'MMMM yyyy', { locale: id })}
+            </div>
+            <button 
+              onClick={handleNextMonth} 
+              disabled={isCurrentMonth}
+              className={cn("p-0.5 rounded-full transition-colors", isCurrentMonth ? "opacity-30 cursor-not-allowed" : "text-white/80 hover:text-white hover:bg-white/10")}
+            >
+              <ArrowUpRight size={14} className="rotate-45" />
+            </button>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
             <div className="bg-white/10 p-4 rounded-2xl backdrop-blur-sm border border-white/10">
               <div className="flex items-center gap-2 mb-1">
                 <div className="p-1 bg-green-500/20 rounded-md">
@@ -1193,6 +1614,22 @@ export default function App() {
 
         {activeTab === 'history' && (
           <section className="space-y-6">
+            <div className="flex items-center justify-between bg-white rounded-full px-4 py-2 border border-gray-100 shadow-sm">
+              <button onClick={handlePrevMonth} className="p-1 hover:bg-gray-50 text-gray-500 hover:text-blu-primary rounded-full transition-colors">
+                <ArrowDownLeft size={18} className="rotate-45" />
+              </button>
+              <div className="text-sm font-bold text-gray-800 tracking-widest uppercase">
+                {format(selectedMonth, 'MMMM yyyy', { locale: id })}
+              </div>
+              <button 
+                onClick={handleNextMonth} 
+                disabled={isCurrentMonth}
+                className={cn("p-1 rounded-full transition-colors", isCurrentMonth ? "opacity-30 text-gray-400" : "hover:bg-gray-50 text-gray-500 hover:text-blu-primary")}
+              >
+                <ArrowUpRight size={18} className="rotate-45" />
+              </button>
+            </div>
+
             <div className="flex justify-between items-center">
               <h2 className="text-2xl font-bold text-gray-800">Catatan Riwayat</h2>
               <div className="flex items-center gap-2">
@@ -1204,6 +1641,16 @@ export default function App() {
                   className="hidden" 
                 />
                 <div className="flex bg-white rounded-xl shadow-sm overflow-hidden">
+                  {user && (
+                    <button 
+                      onClick={handleRemoveDuplicates}
+                      className="p-2 text-rose-500 hover:bg-rose-50 transition-colors border-r border-gray-100 flex items-center gap-1"
+                      title="Hapus Data Duplikat"
+                    >
+                      <span className="text-[10px] font-bold">Hapus Ganda</span>
+                      <X size={14} />
+                    </button>
+                  )}
                   <button 
                     onClick={handleExportCSV}
                     className="p-2 text-gray-500 hover:text-blu-primary hover:bg-gray-50 transition-colors border-r border-gray-100 flex items-center gap-1"
@@ -1341,8 +1788,18 @@ export default function App() {
               >
                 <div className="flex items-center justify-between px-1">
                   <p className="text-xs font-bold text-gray-400 uppercase tracking-widest">
-                    Ringkasan {filterClassification === 'personal' ? 'Pribadi' : filterClassification === 'business' ? 'Bisnis' : ''} • {format(new Date(), 'MMMM')}
+                    Ringkasan {filterClassification === 'personal' ? 'Pribadi' : filterClassification === 'business' ? 'Bisnis' : ''} • {format(selectedMonth, 'MMMM yyyy', {locale: id})}
                   </p>
+                  {filterClassification === 'business' && (
+                    <button 
+                      onClick={analyzeBusinessWithAI}
+                      disabled={isAiAnalyzing}
+                      className="text-xs font-bold text-blu-primary flex items-center gap-1 bg-blue-50 px-2 py-1 rounded-full hover:bg-blue-100 transition-colors"
+                    >
+                      {isAiAnalyzing ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />}
+                      Analisis AI
+                    </button>
+                  )}
                 </div>
                 <div className="grid grid-cols-2 gap-3">
                   <div className="bg-green-50 p-4 rounded-2xl border border-green-100 shadow-sm">
@@ -1398,80 +1855,6 @@ export default function App() {
             </div>
           </section>
         )}
-
-        {activeTab === 'debt' && (
-          <section className="space-y-6">
-            <div className="flex justify-between items-center px-1">
-              <h2 className="text-2xl font-bold text-gray-800">Hutang & Piutang</h2>
-              <div className="flex bg-white rounded-xl shadow-sm overflow-hidden p-1">
-                <button 
-                  onClick={handleExportExcel}
-                  className="p-2 text-gray-500 hover:text-blu-primary transition-colors flex items-center gap-1"
-                  title="Export Excel"
-                >
-                  <Download size={18} />
-                </button>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-2 gap-3">
-              <div className="bg-orange-50 p-4 rounded-3xl border border-orange-100 shadow-sm relative overflow-hidden">
-                <div className="absolute -right-2 -top-2 opacity-10">
-                  <ArrowDownLeft size={64} className="text-orange-600" />
-                </div>
-                <p className="text-[10px] font-bold text-orange-600 uppercase tracking-tighter mb-1 relative z-10">Piutang (Pinjam)</p>
-                <p className="text-xl font-black text-orange-900 relative z-10">{formatCurrency(debtStats.borrow)}</p>
-                <p className="text-[9px] text-orange-600/60 mt-1">Uang yang kamu pinjam</p>
-              </div>
-              <div className="bg-blue-50 p-4 rounded-3xl border border-blue-100 shadow-sm relative overflow-hidden">
-                <div className="absolute -right-2 -top-2 opacity-10">
-                  <ArrowUpRight size={64} className="text-blue-600" />
-                </div>
-                <p className="text-[10px] font-bold text-blue-600 uppercase tracking-tighter mb-1 relative z-10">Utang (Meminjami)</p>
-                <p className="text-xl font-black text-blue-900 relative z-10">{formatCurrency(debtStats.lend)}</p>
-                <p className="text-[9px] text-blue-600/60 mt-1">Uang yang kamu pinjamkan</p>
-              </div>
-            </div>
-
-            <div className="space-y-4">
-              <div className="flex justify-between items-center px-1">
-                <h3 className="text-sm font-bold text-gray-400 uppercase tracking-widest">Daftar Tagihan</h3>
-                {filteredTransactions.length > 0 && (
-                  <span className="text-[10px] bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full font-bold">
-                    {filteredTransactions.length} Transaksi
-                  </span>
-                )}
-              </div>
-              
-              {filteredTransactions.length === 0 ? (
-                <div className="flex flex-col items-center justify-center py-16 bg-white rounded-3xl border border-dashed border-gray-200">
-                  <div className="w-16 h-16 bg-gray-50 rounded-full flex items-center justify-center mb-4">
-                    <CreditCard size={32} className="text-gray-300" />
-                  </div>
-                  <p className="text-gray-400 font-bold text-sm">Tidak ada hutang aktif</p>
-                  <p className="text-gray-300 text-xs mt-1">Gunakan tombol + untuk menambah</p>
-                </div>
-              ) : (
-                <div className="space-y-3">
-                  <AnimatePresence>
-                    {filteredTransactions.map(t => (
-                      <TransactionItem 
-                        key={t.id} 
-                        transaction={t} 
-                        onDelete={() => setTransactionToDelete(t)} 
-                        onEdit={() => handleEditClick(t)}
-                        onToggleSettled={() => handleToggleSettled(t.id)}
-                        formatCurrency={formatCurrency}
-                        isRevealed={revealedId === t.id}
-                        onReveal={(isRevealed) => handleReveal(t.id, isRevealed)}
-                      />
-                    ))}
-                  </AnimatePresence>
-                </div>
-              )}
-            </div>
-          </section>
-        )}
       </main>
 
       {/* Stats Detail Overlay */}
@@ -1484,29 +1867,48 @@ export default function App() {
             transition={{ type: 'spring', damping: 25, stiffness: 200 }}
             className="fixed inset-0 bg-gray-50 z-[150] flex flex-col"
           >
-            <header className="p-6 bg-white border-b border-gray-100 flex justify-between items-center">
-              <div className="flex items-center gap-3">
-                {selectedCategory && (
-                  <button 
-                    onClick={() => setSelectedCategory(null)}
-                    className="p-2 bg-gray-100 rounded-full hover:bg-gray-200 transition-colors"
-                  >
-                    <ArrowDownLeft className="rotate-45" size={18} />
-                  </button>
-                )}
-                <h2 className="text-xl font-bold text-gray-800">
-                  {selectedCategory ? `Statistik ${selectedCategory}` : 'Detail Statistik'}
-                </h2>
+            <header className="p-6 bg-white border-b border-gray-100 flex flex-col gap-4">
+              <div className="flex justify-between items-center">
+                <div className="flex items-center gap-3">
+                  {selectedCategory && (
+                    <button 
+                      onClick={() => setSelectedCategory(null)}
+                      className="p-2 bg-gray-100 rounded-full hover:bg-gray-200 transition-colors"
+                    >
+                      <ArrowDownLeft className="rotate-45" size={18} />
+                    </button>
+                  )}
+                  <h2 className="text-xl font-bold text-gray-800">
+                    {selectedCategory ? `Statistik ${selectedCategory}` : 'Detail Statistik'}
+                  </h2>
+                </div>
+                <button 
+                  onClick={() => {
+                    setIsStatsDetailOpen(false);
+                    setSelectedCategory(null);
+                  }}
+                  className="p-2 bg-gray-100 rounded-full hover:bg-gray-200 transition-colors"
+                >
+                  <X size={20} />
+                </button>
               </div>
-              <button 
-                onClick={() => {
-                  setIsStatsDetailOpen(false);
-                  setSelectedCategory(null);
-                }}
-                className="p-2 bg-gray-100 rounded-full hover:bg-gray-200 transition-colors"
-              >
-                <X size={20} />
-              </button>
+
+              {/* Month Picker for Stats */}
+              <div className="flex items-center justify-between bg-gray-50 rounded-full px-4 py-2 border border-gray-100">
+                <button onClick={handlePrevMonth} className="p-1 hover:bg-white text-gray-500 rounded-full transition-colors">
+                  <ArrowDownLeft size={16} className="rotate-45" />
+                </button>
+                <div className="text-sm font-bold text-gray-700 tracking-widest uppercase">
+                  {format(selectedMonth, 'MMMM yyyy', { locale: id })}
+                </div>
+                <button 
+                  onClick={handleNextMonth} 
+                  disabled={isCurrentMonth}
+                  className={cn("p-1 rounded-full transition-colors", isCurrentMonth ? "opacity-30 text-gray-400" : "hover:bg-white text-gray-500")}
+                >
+                  <ArrowUpRight size={16} className="rotate-45" />
+                </button>
+              </div>
             </header>
             <div className="flex-1 overflow-y-auto p-6 space-y-8">
               {!selectedCategory ? (
@@ -1522,21 +1924,23 @@ export default function App() {
                             statsView === 'weekly' ? "bg-white text-blu-primary shadow-sm" : "text-gray-500"
                           )}
                         >
-                          Mingguan
+                          Bulanan
                         </button>
-                        <button 
-                          onClick={() => setStatsView('daily')}
-                          className={cn(
-                            "px-4 py-1.5 text-[10px] font-bold rounded-lg transition-all",
-                            statsView === 'daily' ? "bg-white text-blu-primary shadow-sm" : "text-gray-500"
-                          )}
-                        >
-                          Hari Ini
-                        </button>
+                        {isCurrentMonth && (
+                          <button 
+                            onClick={() => setStatsView('daily')}
+                            className={cn(
+                              "px-4 py-1.5 text-[10px] font-bold rounded-lg transition-all",
+                              statsView === 'daily' ? "bg-white text-blu-primary shadow-sm" : "text-gray-500"
+                            )}
+                          >
+                            Hari Ini
+                          </button>
+                        )}
                       </div>
                     </div>
 
-                    {statsView === 'daily' ? (
+                    {statsView === 'daily' && isCurrentMonth ? (
                       <div className="space-y-6">
                         <div className="h-64 w-full">
                           <ResponsiveContainer width="100%" height="100%">
@@ -1895,7 +2299,7 @@ export default function App() {
         )}
       </AnimatePresence>
 
-      <div className="fixed bottom-24 right-6 flex flex-col items-end gap-4 z-[100]">
+      <div className="fixed bottom-28 right-6 flex flex-col items-end gap-4 z-[100]">
         <AnimatePresence>
           {isAddMenuOpen && (
             <div className="flex flex-col items-end gap-3 mb-2">
@@ -1952,7 +2356,6 @@ export default function App() {
       <nav className="fixed bottom-0 left-0 right-0 max-w-md mx-auto bg-white border-t border-gray-200 px-2 py-3 flex justify-around items-center z-50 rounded-t-[32px] shadow-[0_-10px_30px_rgba(0,0,0,0.08)]">
         {[
           { id: 'home', icon: <Wallet size={24} />, label: 'Beranda' },
-          { id: 'debt', icon: <CreditCard size={24} />, label: 'Hutang' },
           { id: 'history', icon: <History size={24} />, label: 'Riwayat' },
         ].map((tab) => (
           <button 
@@ -1976,6 +2379,148 @@ export default function App() {
           </button>
         ))}
       </nav>
+
+      {/* AI Analysis Modal */}
+      <AnimatePresence>
+        {isAiAnalysisModalOpen && (
+          <motion.div 
+            initial={{ y: '100%' }}
+            animate={{ y: 0 }}
+            exit={{ y: '100%' }}
+            transition={{ type: 'spring', damping: 25, stiffness: 200 }}
+            className="fixed inset-0 bg-gray-50 z-[150] flex flex-col"
+          >
+            <header className="p-6 bg-white border-b border-gray-100 flex flex-col gap-4">
+              <div className="flex justify-between items-center">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 bg-blue-100/50 rounded-xl">
+                    <Sparkles size={20} className="text-blu-primary" />
+                  </div>
+                  <h2 className="text-xl font-bold text-gray-800">Analisis AI Bisnis</h2>
+                </div>
+                <button 
+                  onClick={() => setIsAiAnalysisModalOpen(false)}
+                  className="p-2 bg-gray-100 rounded-full hover:bg-gray-200 transition-colors"
+                >
+                  <X size={20} />
+                </button>
+              </div>
+            </header>
+            <div className="flex-1 overflow-y-auto p-6 space-y-6 bg-gray-50">
+              <div className="bg-white p-6 rounded-3xl border border-blue-100 shadow-sm relative overflow-hidden">
+                <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-bl from-blue-100/40 to-transparent rounded-bl-full pointer-events-none" />
+                <div className="flex items-center gap-2 mb-6">
+                  <Bot size={20} className="text-blu-primary" />
+                  <p className="text-sm font-bold text-blu-primary">Insight AI - {format(selectedMonth, 'MMMM yyyy', {locale: id})}</p>
+                </div>
+                <div className="text-sm text-gray-700 space-y-4 whitespace-pre-wrap leading-relaxed relative z-10">
+                  {aiAnalysisResult}
+                </div>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Debt Detail Overlay */}
+      <AnimatePresence>
+        {isDebtModalOpen && (
+          <motion.div 
+            initial={{ y: '100%' }}
+            animate={{ y: 0 }}
+            exit={{ y: '100%' }}
+            transition={{ type: 'spring', damping: 25, stiffness: 200 }}
+            className="fixed inset-0 bg-gray-50 z-[150] flex flex-col"
+          >
+            <header className="p-6 bg-white border-b border-gray-100 flex flex-col gap-4">
+              <div className="flex justify-between items-center">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 bg-orange-100/50 rounded-xl text-orange-600">
+                    <CreditCard size={20} />
+                  </div>
+                  <h2 className="text-xl font-bold text-gray-800">Hutang & Piutang</h2>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button 
+                    onClick={handleExportExcel}
+                    className="p-2 text-gray-500 hover:text-blu-primary hover:bg-gray-100 rounded-full transition-colors flex items-center justify-center"
+                    title="Export Excel"
+                  >
+                    <Download size={18} />
+                  </button>
+                  <button 
+                    onClick={() => setIsDebtModalOpen(false)}
+                    className="p-2 bg-gray-100 rounded-full hover:bg-gray-200 transition-colors"
+                  >
+                    <X size={20} />
+                  </button>
+                </div>
+              </div>
+            </header>
+
+            <div className="flex-1 overflow-y-auto p-6 space-y-6">
+              <div className="grid grid-cols-2 gap-3">
+                <div className="bg-orange-50 p-4 rounded-3xl border border-orange-100 shadow-sm relative overflow-hidden">
+                  <div className="absolute -right-2 -top-2 opacity-10">
+                    <ArrowDownLeft size={64} className="text-orange-600" />
+                  </div>
+                  <p className="text-[10px] font-bold text-orange-600 uppercase tracking-tighter mb-1 relative z-10">Piutang (Pinjam)</p>
+                  <p className="text-xl font-black text-orange-900 relative z-10">{formatCurrency(debtStats.borrow)}</p>
+                  <p className="text-[9px] text-orange-600/60 mt-1">Uang yang kamu pinjam</p>
+                </div>
+                <div className="bg-blue-50 p-4 rounded-3xl border border-blue-100 shadow-sm relative overflow-hidden">
+                  <div className="absolute -right-2 -top-2 opacity-10">
+                    <ArrowUpRight size={64} className="text-blue-600" />
+                  </div>
+                  <p className="text-[10px] font-bold text-blue-600 uppercase tracking-tighter mb-1 relative z-10">Utang (Meminjami)</p>
+                  <p className="text-xl font-black text-blue-900 relative z-10">{formatCurrency(debtStats.lend)}</p>
+                  <p className="text-[9px] text-blue-600/60 mt-1">Uang yang kamu pinjamkan</p>
+                </div>
+              </div>
+
+              <div className="space-y-4">
+                <div className="flex justify-between items-center px-1">
+                  <h3 className="text-sm font-bold text-gray-400 uppercase tracking-widest">Daftar Tagihan</h3>
+                  {transactions.filter(t => t.type === 'debt').length > 0 && (
+                    <span className="text-[10px] bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full font-bold">
+                      {transactions.filter(t => t.type === 'debt').length} Transaksi
+                    </span>
+                  )}
+                </div>
+                
+                {transactions.filter(t => t.type === 'debt').length === 0 ? (
+                  <div className="flex flex-col items-center justify-center py-16 bg-white rounded-3xl border border-dashed border-gray-200">
+                    <div className="w-16 h-16 bg-gray-50 rounded-full flex items-center justify-center mb-4">
+                      <CreditCard size={32} className="text-gray-300" />
+                    </div>
+                    <p className="text-gray-400 font-bold text-sm">Tidak ada hutang aktif</p>
+                    <p className="text-gray-300 text-xs mt-1">Gunakan tombol + untuk menambah</p>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    <AnimatePresence>
+                      {transactions.filter(t => t.type === 'debt').map(t => (
+                        <TransactionItem 
+                          key={t.id}
+                          transaction={t} 
+                          onDelete={() => setTransactionToDelete(t)} 
+                          onEdit={() => {
+                            handleEditClick(t);
+                          }}
+                          onToggleSettled={() => handleToggleSettled(t)}
+                          formatCurrency={formatCurrency}
+                          isRevealed={revealedId === t.id}
+                          onReveal={(isRevealed) => handleReveal(t.id, isRevealed)}
+                        />
+                      ))}
+                    </AnimatePresence>
+                  </div>
+                )}
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Scanner Modal */}
       {isScannerOpen && (

@@ -11,6 +11,7 @@ export interface Transaction {
   date: string;
   time: string; // HH:mm format
   classification: TransactionClassification;
+  ownerId?: string;
   isDebt?: boolean;
   debtType?: DebtType;
   isSettled?: boolean;
